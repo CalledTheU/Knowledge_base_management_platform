@@ -1,0 +1,106 @@
+- generic [ref=e13]:
+  - complementary [ref=e14]:
+    - link "知 知序 KNOWLEDGE HUB" [ref=e15] [cursor=pointer]:
+      - /url: "#"
+      - generic [ref=e16]: 知
+      - generic [ref=e17]:
+        - text: 知序
+        - generic [ref=e18]: KNOWLEDGE HUB
+    - generic [ref=e19]: 工作空间
+    - button "▦运营概览" [ref=e20] [cursor=pointer]:
+      - generic [ref=e21]: ▦
+      - text: 运营概览
+    - button "▤知识维护" [ref=e22] [cursor=pointer]:
+      - generic [ref=e23]: ▤
+      - text: 知识维护
+    - button "◌智能问答" [ref=e24] [cursor=pointer]:
+      - generic [ref=e25]: ◌
+      - text: 智能问答
+    - button "✳知识沉淀" [ref=e26] [cursor=pointer]:
+      - generic [ref=e27]: ✳
+      - text: 知识沉淀
+    - generic [ref=e28]: 系统管理
+    - button "♧组织与账号" [ref=e29] [cursor=pointer]:
+      - generic [ref=e30]: ♧
+      - text: 组织与账号
+    - generic [ref=e31]:
+      - generic [ref=e33]: 本地演示环境
+      - button "退出登录" [ref=e34] [cursor=pointer]: ↗
+  - main [ref=e35]:
+    - generic [ref=e36]:
+      - generic [ref=e37]: 知识平台 / 运营概览
+      - generic [ref=e38]:
+        - generic [ref=e39]: 系统管理员
+        - generic [ref=e40]: 系
+    - generic [ref=e41]:
+      - generic [ref=e42]:
+        - generic [ref=e43]:
+          - generic [ref=e44]: 平台运行情况
+          - heading "运营概览" [level=1] [ref=e45]
+        - button "↻ 刷新数据" [ref=e46] [cursor=pointer]
+      - generic [ref=e47]:
+        - generic [ref=e48]:
+          - generic [ref=e49]:
+            - generic [ref=e50]: ◌
+            - text: 问答总量
+          - generic [ref=e51]: "7"
+          - generic [ref=e52]: 累计问答轮次
+        - generic [ref=e53]:
+          - generic [ref=e54]:
+            - generic [ref=e55]: ♧
+            - text: 独立用户
+          - generic [ref=e56]: "2"
+          - generic [ref=e57]: 参与提问用户
+        - generic [ref=e58]:
+          - generic [ref=e59]:
+            - generic [ref=e60]: ▤
+            - text: 知识单元
+          - generic [ref=e61]: "3"
+          - generic [ref=e62]: 平台知识资产
+        - generic [ref=e63]:
+          - generic [ref=e64]:
+            - generic [ref=e65]: ⌘
+            - text: Token 消耗
+          - generic [ref=e66]: "136"
+          - generic [ref=e67]: 估算输入与输出
+        - generic [ref=e68]:
+          - generic [ref=e69]:
+            - generic [ref=e70]: ◷
+            - text: 平均响应
+          - generic [ref=e71]: NaN
+          - generic [ref=e72]: 检索与处理耗时
+      - generic [ref=e73]:
+        - generic [ref=e74]:
+          - generic [ref=e75]:
+            - generic [ref=e76]:
+              - heading "高频提问" [level=2] [ref=e77]
+              - paragraph [ref=e78]: 按问题汇总的问答次数
+            - generic [ref=e79]: TOP 8
+          - generic [ref=e80]:
+            - generic [ref=e81]:
+              - generic [ref=e82]: "01"
+              - generic "差旅报销需要哪些材料？" [ref=e83]
+              - generic [ref=e84]: 4 次
+            - generic [ref=e85]:
+              - generic [ref=e86]: "02"
+              - generic "商品破损如何申请退款？" [ref=e87]
+              - generic [ref=e88]: 2 次
+            - generic [ref=e89]:
+              - generic [ref=e90]: "03"
+              - generic "你是谁" [ref=e91]
+              - generic [ref=e92]: 1 次
+        - generic [ref=e93]:
+          - generic [ref=e94]:
+            - generic [ref=e95]:
+              - heading "热门知识" [level=2] [ref=e96]
+              - paragraph [ref=e97]: 被问答引用最多的知识
+            - generic [ref=e98]: TOP 8
+          - generic [ref=e99]:
+            - generic [ref=e100]:
+              - generic [ref=e101]: "01"
+              - generic "差旅报销标准" [ref=e102]
+              - generic [ref=e103]: 6 次
+            - generic [ref=e104]:
+              - generic [ref=e105]: "02"
+              - generic "销售退换货处理规范" [ref=e106]
+              - generic [ref=e107]: 2 次

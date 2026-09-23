@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>知识库管理平台</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div id="login" class="login-shell">
+    <form id="login-form" class="login-panel">
+      <div class="brand-mark">知</div><h1>知识库管理平台</h1><p>组织知识 · 安全问答</p>
+      <label>账号<input name="username" autocomplete="username" value="admin" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" value="Admin123!" required></label>
+      <button class="primary wide">登录</button><div class="login-error" id="login-error"></div>
+    </form>
+  </div>
+  <div id="app" hidden>
+    <aside class="sidebar">
+      <a class="brand" id="brand-home" href="#"><span class="brand-mark">知</span><span>知序<span class="brand-caption"> KNOWLEDGE HUB</span></span></a>
+      <div class="nav-label">工作空间</div>
+      <button class="nav" data-permission="dashboard.view" data-view="dashboard"><span class="nav-icon">▦</span>运营概览</button>
+      <button class="nav" data-permission="knowledge.manage" data-view="documents"><span class="nav-icon">▤</span>知识维护</button>
+      <button class="nav" data-permission="chat.access" data-view="chat"><span class="nav-icon">◌</span>智能问答</button>
+      <button class="nav" data-permission="curation.manage" data-view="curation"><span class="nav-icon">✳</span>知识沉淀</button>
+      <div class="nav-label">系统管理</div>
+      <button class="nav" data-permission="organization.manage" data-view="organization"><span class="nav-icon">♧</span>组织与账号</button>
+      <div class="side-bottom"><span class="status-dot"></span><span>本地演示环境</span><button id="logout" class="icon-button" title="退出登录" aria-label="退出登录">↗</button></div>
+    </aside>
+    <main class="main">
+      <header class="topbar"><div class="crumb">知识平台 <span>/</span> <b id="page-crumb">运营概览</b></div><div class="profile"><span id="user-name"></span><span id="user-avatar" class="avatar">王</span></div></header>
+      <section id="view-dashboard" class="view">
+        <div class="page-heading"><div><div class="eyebrow">平台运行情况</div><h1>运营概览</h1></div><button class="secondary" onclick="loadDashboard()">↻ 刷新数据</button></div>
+        <div class="metric-grid" id="metrics"></div>
+        <div class="dashboard-grid"><div class="panel"><div class="panel-head"><div><h2>高频提问</h2><p>按问题汇总的问答次数</p></div><span class="subtle">TOP 8</span></div><div id="top-questions" class="rank-list"></div></div>
+          <div class="panel"><div class="panel-head"><div><h2>热门知识</h2><p>被问答引用最多的知识</p></div><span class="subtle">TOP 8</span></div><div id="top-knowledge" class="rank-list"></div></div></div>
+      </section>
+      <section id="view-documents" class="view" hidden>
+        <div class="page-heading"><div><div class="eyebrow">知识资产</div><h1>知识维护</h1></div><label class="primary upload-button">＋ 导入文件<input id="upload-files" type="file" multiple accept=".pdf,.md,.txt,.docx"></label></div>
+        <div id="import-status" class="import-status" role="status" aria-live="polite" hidden><progress id="import-progress" max="1" value="0"></progress><span id="import-result"></span></div>
+        <div class="toolbar"><div class="search"><span>⌕</span><input id="doc-search" placeholder="搜索标题或分类"></div><span id="doc-count" class="subtle"></span></div>
+        <div class="table-wrap"><table><thead><tr><th>知识单元</th><th>分类</th><th>格式</th><th>访问范围</th><th>切片</th><th>状态</th><th></th></tr></thead><tbody id="doc-rows"></tbody></table></div>
+      </section>
+      <section id="view-chat" class="view" hidden>
+        <div class="page-heading"><div><div class="eyebrow">授权检索问答</div><h1>智能问答</h1></div><button id="new-chat" class="secondary">＋ 新会话</button></div>
+        <p id="chat-access-summary" class="chat-access-summary" hidden></p>
+        <div class="chat-layout"><div class="chat-main"><div id="chat-messages" class="messages"><div class="welcome"><div class="welcome-icon">✳</div><h2>有什么知识问题？</h2><p>回答只会使用当前账号有权访问的知识。</p><div class="suggestions"><button>差旅报销需要哪些材料？</button><button>商品破损如何申请退款？</button><button>高管薪酬政策是什么？</button></div></div></div>
+          <form id="ask-form" class="ask-form"><textarea id="question" rows="1" placeholder="输入问题，按 Enter 发送" required></textarea><button class="send-button" title="发送" aria-label="发送">↑</button></form><div class="chat-disclaimer">回答由知识库内容生成，请核对引用来源。</div></div>
+          <aside class="chat-aside"><h3>当前身份</h3><div class="identity-card"><span id="chat-avatar" class="avatar large">王</span><div><b id="chat-user"></b><span id="chat-dept"></span></div></div><div class="aside-rule"></div><h3>最近引用</h3><div id="recent-citations" class="recent-citations"><div class="empty-small">本次对话的引用将显示在这里</div></div><div id="restricted-note" class="restricted-note" hidden>部分匹配资料因权限受限无法展示。</div></aside></div>
+      </section>
+      <section id="view-curation" class="view" hidden>
+        <div class="page-heading"><div><div class="eyebrow">问答驱动知識迭代</div><h1>知识沉淀</h1></div></div>
+        <div class="tabs"><button class="tab active" data-tab="faq">FAQ 审核 <span id="faq-count" class="count-badge">0</span></button><button class="tab" data-tab="gaps">知识缺口 <span id="gap-count" class="count-badge">0</span></button></div>
+        <div id="faq-list" class="curation-list"></div><div id="gap-list" class="curation-list" hidden></div>
+      </section>
+      <section id="view-organization" class="view" hidden>
+        <div class="page-heading"><div><div class="eyebrow">身份与访问控制</div><h1>组织与账号</h1></div><button id="add-user-toggle" class="primary">＋ 新建用户</button></div>
+        <div id="add-user-form-wrap" class="panel form-panel" hidden><h2 id="user-form-title">创建用户</h2><form id="add-user-form" class="inline-form"><input name="username" placeholder="登录账号" required><input name="display_name" placeholder="显示名称" required><input name="password" type="password" placeholder="初始密码（至少8位）" required><select name="department_id" id="new-user-dept"></select><select name="roles" id="new-user-roles" multiple aria-label="用户角色"></select><button class="primary">保存</button><button type="button" class="secondary" id="cancel-user-edit">取消</button></form></div>
+        <div class="org-grid"><div class="panel"><div class="panel-head"><div><h2>部门架构</h2><p>支持上下级与部门权限</p></div></div><form id="department-form" class="inline-form"><input name="name" placeholder="部门名称" required><select name="parent_id" id="department-parent"><option value="">无上级部门</option></select><button class="primary" id="department-save">添加</button><button type="button" class="secondary" id="department-cancel" hidden>取消</button></form><div id="departments" class="department-list"></div></div><div class="panel"><div class="panel-head"><div><h2>角色功能权限</h2><p>权限在后端逐请求校验</p></div></div><form id="role-form"><input name="name" placeholder="新角色名称" required><fieldset class="permission-grid"><legend>可访问功能</legend><label><input type="checkbox" name="permissions" value="dashboard.view"> 运营概览</label><label><input type="checkbox" name="permissions" value="knowledge.manage"> 知识维护</label><label><input type="checkbox" name="permissions" value="chat.access"> AI 问答</label><label><input type="checkbox" name="permissions" value="curation.manage"> 知识沉淀</label><label><input type="checkbox" name="permissions" value="organization.manage"> 组织与账号</label></fieldset><button class="primary" id="role-save">添加角色</button><button type="button" class="secondary" id="role-cancel" hidden>取消</button></form><div id="roles" class="department-list"></div></div><div class="panel"><div class="panel-head"><div><h2>用户与角色</h2><p>维护账号所属部门和授权角色</p></div></div><div class="table-wrap"><table><thead><tr><th>用户</th><th>部门</th><th>角色</th><th>状态</th><th></th></tr></thead><tbody id="user-rows"></tbody></table></div></div></div>
+      </section>
+      <section id="view-access" class="view" hidden>
+        <div class="access-preview"><div class="access-icon">i</div><h1 id="access-title">功能预览</h1><p id="access-message"></p><p id="access-detail" class="access-detail"></p><button id="access-back" class="primary">返回可用功能</button></div>
+      </section>
+    </main>
+  </div>
+  <dialog id="acl-dialog"><form method="dialog" id="acl-form"><div class="dialog-head"><div><div class="eyebrow">数据访问策略</div><h2 id="acl-title">配置权限</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div><p class="dialog-description">满足任一已选条件即可访问。未配置时默认仅导入者可见。</p><input type="hidden" id="acl-doc-id"><label class="check-row"><input type="checkbox" id="acl-global"> <span><b>全局公开</b><small>所有已登录用户均可访问</small></span></label><div class="selector-block"><h3>部门</h3><div id="acl-departments" class="choice-grid"></div></div><div class="selector-block"><h3>角色</h3><div class="choice-grid acl-role-list"></div></div><div class="selector-block"><h3>个人</h3><div id="acl-users" class="choice-grid"></div></div><div class="dialog-actions"><button class="secondary" value="cancel">取消</button><button id="save-acl" class="primary" value="default">保存权限</button></div></form></dialog>
+  <script src="/static/app.js"></script>
+</body>
+</html>

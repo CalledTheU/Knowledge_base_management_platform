@@ -1,0 +1,11 @@
+- generic [ref=e3]:
+  - generic [ref=e4]: 知
+  - heading "知识库管理平台" [level=1] [ref=e5]
+  - paragraph [ref=e6]: 组织知识 · 安全问答
+  - generic [ref=e7]:
+    - text: 账号
+    - textbox "账号" [ref=e8]: admin
+  - generic [ref=e9]:
+    - text: 密码
+    - textbox "密码" [ref=e10]: Admin123!
+  - button "登录" [ref=e11] [cursor=pointer]
