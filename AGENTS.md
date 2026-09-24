@@ -9,7 +9,7 @@
 
 ## Tracked project guidance
 
-- Keep `data/知识库管理平台.md`, `data/start_with_me.md`, and `.agents/skills/` in version control.
+- Keep `data/知识库管理平台-总需求文档.md.md`, `data/start_with_me.md`, and `.agents/skills/` in version control.
 - Runtime SQLite databases and imported source files under `data/uploads/` are generated/user data and must remain untracked.
 
 ## Python files

@@ -15,6 +15,22 @@ python main.py
 
 访问 <http://127.0.0.1:8000>。Swagger API 文档在 <http://127.0.0.1:8000/docs>。
 
+## 外部 RAG 服务
+
+配置以下环境变量后，导入和问答会使用参考项目同样的 MinIO、Milvus、BGE-M3、BGE Reranker 和 DeepSeek 链路：
+
+```text
+KB_RAG_BACKEND=milvus
+KB_MILVUS_URI=http://192.168.10.129:19530
+KB_MINIO_ENDPOINT=http://192.168.10.129:9000
+KB_MINIO_ACCESS_KEY=...
+KB_MINIO_SECRET_KEY=...
+DEEPSEEK_API_KEY=...
+LLM_DEFAULT_MODEL=deepseek-flash
+```
+
+平台使用独立的 `kb_platform_chunks_v1` collection 和 `knowledge-base-files` bucket。未配置外部服务时可用 `KB_RAG_BACKEND=sqlite` 运行离线权限和功能测试；不会把离线结果写入 Milvus 或 MinIO。
+
 演示账号：`admin / Admin123!`（平台管理员）、`finance / Finance123!`（财务部门）、`staff / Staff123!`（业务部门）。登录后可切换用户验证部门/角色权限。首次启动生成的 SQLite 数据在 `data/knowledge.db`；上传源文件在 `data/uploads/`。可通过 `KB_DB_PATH` 指定数据库文件。
 
 支持 PDF、DOCX、Markdown、TXT；文件最大 20MB，单次最多 30 个。导入知识默认仅当前管理员可见，需在台账中配置 ACL 后开放。权限实体为 `global`、`department`、`role`、`user`，符合任一实体即可读取，空 ACL 默认拒绝访问。

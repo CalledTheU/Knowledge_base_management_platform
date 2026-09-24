@@ -13,3 +13,7 @@ class DocumentUpdate(BaseModel):
 
 class ACLUpdate(BaseModel):
     permissions: list[dict[str, str]] = Field(default_factory=list)
+
+
+class ChunkUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=20000)

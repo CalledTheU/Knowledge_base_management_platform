@@ -1,42 +1,31 @@
-# 知识库管理平台阶段交接
+# Knowledge Base Management Platform - Handoff
 
-完整需求和验收标准见 [知识库管理平台.md](知识库管理平台.md)。历史每阶段保留一条摘要；当前阶段保留可继续开发所需细节。
+## Current stage: external RAG ingestion and retrieval (2026-09-24)
 
-## 阶段历史
+- Completed: imported files are parsed with MinerU when the CLI is installed, otherwise the existing PDF/DOCX/TXT/Markdown parsers are used; Markdown is split with heading context and bounded recursive chunks. BGE-M3 creates dense+sparse vectors, MinIO stores the source object, and an independent Milvus collection stores chunk vectors when external RAG configuration is present. SQLite remains the ACL and document metadata source of truth.
+- Completed: chat uses direct Milvus hybrid recall plus a HyDE query, RRF fusion, ACL filtering before rerank/generation, local BGE reranking, bounded DeepSeek context, and citations. Existing SQLite retrieval remains available only with explicit `KB_RAG_BACKEND=sqlite` or when external credentials are absent.
+- Completed: import/update/delete roll back or remove MinIO and Milvus records on failure; logs include request IDs. Added tests for heading-aware splitting, external candidate authorization, and import diagnostics.
+- Model: `D:\ai_models\modelscope_cache\models\BAAI\bge-m3`; verified offline on this machine (`dense_dim=1024`, sparse terms present). Hash embeddings are available only when explicitly selecting `KB_EMBEDDING_BACKEND=hash`; model/dependency failures now surface instead of silently pretending to use BGE.
+- Dependency: added `FlagEmbedding>=1.3.3` alongside `pymilvus[model]` so a fresh environment includes the actual BGE-M3 implementation.
+- Verification: offline BGE-M3 encoding -> dense dimension 1024 and sparse terms present; temporary SQLite + API import/chat flow -> one TXT chunk imported, dense/sparse vectors stored, semantic question retrieved its document; `.venv\Scripts\python.exe -m unittest discover -s tests -v` -> 10 passed (test suite explicitly selects hash backend); `node --check front/app.js` and `git diff --check` -> passed.
+- Diagnostics update: application logs rotate under `data/logs/app.log`; unexpected API and document import failures include stack traces and a request ID shown in the UI; `test_import_embedding_failure_is_logged_with_error_id` verifies model failure logging. Latest test suite -> 11 passed.
+- Import and retrieval repair: PDF extraction now retries layout mode and rejects heavily corrupted text; historical uploaded documents containing replacement characters are rebuilt from `data/uploads/` at startup; import writes vectors before opening the SQLite transaction; chat retrieves Top-K chunks across documents and keeps ACL filtering. Added `fonttools` for pypdf font decoding. Latest suite -> 12 passed, including multi-chunk import/retrieval.
+- Reference-flow alignment: implemented the reference graph (`PDF -> Markdown/MinerU -> heading chunks -> BGE-M3 hybrid vectors -> Milvus hybrid search -> HyDE/RRF -> BGE rerank -> bounded DeepSeek answer`). A real external smoke test reached DeepSeek, while MinIO SDK and Milvus gRPC timed out against `192.168.10.129`; these two services must be reachable from the runtime before a real file import can succeed.
+- Not completed: external MinIO/Milvus connectivity has not passed; SSE streaming Markdown, background import jobs, and trend charts remain outside this stage.
+- Next: restore MinIO/Milvus network/auth availability, configure the platform environment variables, then run a real PDF import and `HAK 180 是什么设备？` acceptance query with citations.
 
-- 首版交付：登录、文档导入/ACL、关键词问答、FAQ/缺口、基础看板和账号管理；2 项集成测试通过。
-- 文档维护与模块化：文档 API/schema 分层，支持元数据编辑与启停；3 项测试通过。
-- 登录视图修复：修复登录页和工作台纵向并存；真实浏览器验证受自动化连接限制。
-- 组织权限管理：部门树、自定义角色、用户角色分配及动态 ACL 角色；4 项测试通过。
-- 用户状态维护（当前完成）：启停用户、撤销旧会话并保护最后管理员；5 项测试通过。
-- 角色功能 RBAC：角色分配五类模块权限，后端逐请求鉴权、管理员保护、旧库迁移与管理界面；8 项集成测试通过，浏览器角色编辑验证通过。
-- 普通用户导航兜底：所有模块入口可点，无权时给出权限说明；默认进入首个有权模块；修复空权限内置角色并增加回填保护；8 项集成测试通过。
-- 聊天账号隔离：登出清空对话、引用和会话状态，阻止旧请求影响新账号；8 项集成测试及 JS 语法检查通过。
-- 知识导入反馈：多文件逐项提交，显示进度并汇总成功/失败文件；8 项集成测试、JS 语法和 diff 检查通过。
-- 桌面端视觉整理：统一企业后台导航、数据区、表格与控件视觉层级，并修复平均响应指标格式；桌面浏览器复核及 8 项测试通过。
+## History
 
-## 当前阶段：前端视觉改版 - 桌面端
-
-### 已完成
-
-- 将工作台调整为更清晰的企业管理后台视觉：深色侧栏、浅色工作区、明确的指标与内容分组、统一表格/输入/按钮状态。
-- 修复平均响应指标把带单位文本转成 `NaN` 的显示问题。
-- 保留原模块、权限和交互；此前完成的逐文件导入进度功能保持不变。
-
-### 重要遗留
-
-- 前端其他模块虽已覆盖总需求中的主要入口，但 FAQ 内容编辑仍使用原生文本提示框，知识详情/切片查看等未实现能力需按总需求后续逐闭环完善。
-- 本阶段按用户要求不考虑移动端；需要时再做专门的窄屏验收与调整。
-- FAQ 内容编辑仍使用原生文本提示框，知识详情/切片查看等能力需按总需求后续逐闭环完善。
-
-### 验证
-
-- 桌面浏览器 `1280x800` 登录后检查运营概览：通过；平均响应显示 `1 ms`。
-- `node --check front/app.js`：通过。
-- `.venv\\Scripts\\python.exe -m unittest discover -s tests -v`：8 项通过。
-- `git diff --check`：通过。
-- FastAPI `on_event` 仍产生弃用警告，不影响验证结果。
-
-### 下一阶段
-
-继续按总需求推进管理页面视觉与易用性，优先检查知识维护/切片审阅闭环；本阶段未调整该模块功能。
+- Initial platform: login, RBAC, document import/ACL, keyword Q&A, FAQ/gap curation, dashboard, and organization management implemented; baseline integration tests passed.
+- Knowledge detail stage: chunk detail/edit workflow added and verified with backend tests and frontend syntax check.
+- Browser acceptance stage: import progress/result, chunk edit, FAQ cache hit, and no-citation chat rendering verified; fixed a null DOM removal bug in the chat response path.
+- Curation core stage: similar questions aggregate into one candidate, published FAQ cache can be toggled, and gaps can become persistent补充任务; 10 integration tests pass.
+- RAG core stage: wired local BGE-M3 dense+sparse vectors into SQLite ingestion and hybrid query ranking; forced offline model encoding verified at 1024 dense dimensions with sparse terms.
+- External RAG stage: added MinIO/Milvus/HyDE/RRF/rerank/DeepSeek pipeline, heading-aware chunks, rollback cleanup, and ACL-before-model checks; 14 tests pass. DeepSeek real call passed; MinIO/Milvus network smoke tests timed out.
+- MinIO NAT compatibility stage: removed the startup bucket probe that was reset through VMware NAT; source upload now writes directly and creates the bucket only after an explicit `NoSuchBucket`. `rag_service.py` compiles; the existing suite passes through import and retrieval coverage.
+- MinIO region probe fix (2026-09-24): fixed the MinIO client region to `us-east-1`, avoiding the `GetBucketLocation` request that VMware NAT reset during uploads. Real SDK upload/delete smoke test passed; Python and frontend syntax checks passed.
+- Milvus schema compatibility fix (2026-09-24): current `kb_platform_chunks_v1` contains only chunk/document IDs and dense/sparse vectors, so import/update payloads no longer send SQLite-only `ordinal`. `load_collection` is used for current PyMilvus with fallback compatibility. Upsert/delete smoke test passed.
+- Chat/import follow-up (2026-09-24): fixed `sync_pending_chunks()` to use the same Milvus schema-safe payload, preventing chat retrieval from failing on legacy unindexed SQLite chunks. Frontend import status now finishes when the upload API returns, with SSE used for live stage text instead of blocking completion on the event stream.
+- Streaming observability stage (2026-09-24): import SSE reports each parsing/chunking/embedding/MinIO/Milvus/SQLite stage; `/api/chat/stream` reports vectorization, hybrid retrieval, HyDE, RRF, ACL, rerank, generation and completion, while `CHAT_STAGE` entries use the same request ID in `data/logs/app.log`. Answers are emitted in short text chunks and final metadata remains compatible with the existing UI. Verification: 14 tests passed; Python and JavaScript syntax checks passed.
+- Package structure stage (2026-09-24): moved embedding and RAG implementation into `services/`, kept thin root import shims for compatibility, and updated app/router imports. Existing `api/` and `schema/` organization remains; `main.py` is still the composition root to avoid circular imports. Verification: 14 tests passed; Python compilation, frontend syntax, and `git diff --check` passed.
+- Cleanup stage (2026-09-24): removed Playwright artifacts, empty installation residue, Python caches, and obsolete root service implementations after the `services/` move. Preserved runtime data, logs, uploads, requirements, and project documents; added ignore rules for regenerated temporary files. Verification: 14 tests passed; frontend syntax and `git diff --check` passed.

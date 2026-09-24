@@ -63,6 +63,7 @@
     </main>
   </div>
   <dialog id="acl-dialog"><form method="dialog" id="acl-form"><div class="dialog-head"><div><div class="eyebrow">数据访问策略</div><h2 id="acl-title">配置权限</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div><p class="dialog-description">满足任一已选条件即可访问。未配置时默认仅导入者可见。</p><input type="hidden" id="acl-doc-id"><label class="check-row"><input type="checkbox" id="acl-global"> <span><b>全局公开</b><small>所有已登录用户均可访问</small></span></label><div class="selector-block"><h3>部门</h3><div id="acl-departments" class="choice-grid"></div></div><div class="selector-block"><h3>角色</h3><div class="choice-grid acl-role-list"></div></div><div class="selector-block"><h3>个人</h3><div id="acl-users" class="choice-grid"></div></div><div class="dialog-actions"><button class="secondary" value="cancel">取消</button><button id="save-acl" class="primary" value="default">保存权限</button></div></form></dialog>
+  <dialog id="detail-dialog"><form method="dialog" id="detail-form"><div class="dialog-head"><div><div class="eyebrow">知识单元</div><h2 id="detail-title">知识详情</h2></div><button class="icon-button" value="cancel" aria-label="关闭">×</button></div><p class="dialog-description">调整切片文本后保存，问答检索会立即使用新内容。</p><div id="chunk-list" class="chunk-list"></div><div class="dialog-actions"><button class="secondary" value="cancel">取消</button><button class="primary" value="default">保存切片</button></div></form></dialog>
   <script src="/static/app.js"></script>
 </body>
 </html>

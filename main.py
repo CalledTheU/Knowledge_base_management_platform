@@ -5,29 +5,52 @@
 import hashlib
 import hmac
 import json
+import logging
+import logging.handlers
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 import uuid
+import asyncio
+from difflib import SequenceMatcher
 from contextlib import contextmanager
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from api.documents_router import register_router as register_documents_router
 from api.organization_router import register_router as register_organization_router
 from schema.document_schema import ACLUpdate
+from services.embedding_service import encode_documents, encode_query, cosine, sparse_dot
+from services import rag_service
 
-ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
 UPLOADS = DATA / "uploads"
+LOGS = DATA / "logs"
 DB_PATH = Path(os.getenv("KB_DB_PATH", DATA / "knowledge.db"))
 UPLOADS.mkdir(parents=True, exist_ok=True)
+LOGS.mkdir(parents=True, exist_ok=True)
+logger = logging.getLogger("knowledge_base")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOGS / "app.log", maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)s request_id=%(request_id)s %(message)s"))
+    logger.addHandler(file_handler)
 app = FastAPI(title="知识库管理平台", version="0.1.0")
 PERMISSIONS = {"dashboard.view", "knowledge.manage", "curation.manage", "organization.manage", "chat.access"}
 BUILTIN_PERMISSIONS = {
@@ -36,6 +59,14 @@ BUILTIN_PERMISSIONS = {
     "system_admin": sorted(PERMISSIONS),
     "management": ["dashboard.view", "chat.access"],
 }
+_chat_streams = {}
+
+
+def chat_stage(request_id, message):
+    logger.info("CHAT_STAGE stage=%s", message, extra={"request_id": request_id})
+    queue = _chat_streams.get(request_id)
+    if queue:
+        queue.put_nowait({"type": "stage", "stage": message})
 
 
 @contextmanager
@@ -67,23 +98,42 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1);
         CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), expires REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS documents(id TEXT PRIMARY KEY, title TEXT NOT NULL, filename TEXT NOT NULL,
-            category TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, created REAL NOT NULL);
+            category TEXT NOT NULL DEFAULT '', content TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+            created REAL NOT NULL, source_object TEXT);
         CREATE TABLE IF NOT EXISTS acl(document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
             kind TEXT NOT NULL, subject TEXT NOT NULL, PRIMARY KEY(document_id,kind,subject));
         CREATE TABLE IF NOT EXISTS chunks(id TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-            ordinal INTEGER NOT NULL, content TEXT NOT NULL);
+            ordinal INTEGER NOT NULL, content TEXT NOT NULL, dense_vector TEXT, sparse_vector TEXT,
+            vector_indexed INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS chats(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, user_id TEXT NOT NULL,
             question TEXT NOT NULL, answer TEXT NOT NULL, retrieved TEXT NOT NULL, allowed TEXT NOT NULL,
             denied TEXT NOT NULL, tokens INTEGER NOT NULL, latency_ms INTEGER NOT NULL, created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS gaps(id TEXT PRIMARY KEY, question TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL,
             department_id TEXT, count INTEGER NOT NULL DEFAULT 1, created REAL NOT NULL, status TEXT NOT NULL DEFAULT 'open');
         CREATE TABLE IF NOT EXISTS faqs(id TEXT PRIMARY KEY, question TEXT NOT NULL UNIQUE, answer TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'candidate', count INTEGER NOT NULL DEFAULT 1, created REAL NOT NULL);
+            status TEXT NOT NULL DEFAULT 'candidate', count INTEGER NOT NULL DEFAULT 1, created REAL NOT NULL,
+            cache_enabled INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS faq_cache(question TEXT PRIMARY KEY, faq_id TEXT NOT NULL REFERENCES faqs(id));
+        CREATE TABLE IF NOT EXISTS knowledge_tasks(id TEXT PRIMARY KEY, gap_id TEXT NOT NULL UNIQUE REFERENCES gaps(id) ON DELETE CASCADE,
+            title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created REAL NOT NULL);
         """)
+        faq_columns = {r["name"] for r in con.execute("PRAGMA table_info(faqs)")}
+        if "cache_enabled" not in faq_columns:
+            con.execute("ALTER TABLE faqs ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0")
+            con.execute("UPDATE faqs SET cache_enabled=1 WHERE id IN (SELECT faq_id FROM faq_cache) AND status='published'")
         has_permissions = "permissions" in {r["name"] for r in con.execute("PRAGMA table_info(roles)")}
         if not has_permissions:
             con.execute("ALTER TABLE roles ADD COLUMN permissions TEXT NOT NULL DEFAULT '[]'")
+        chunk_columns = {r["name"] for r in con.execute("PRAGMA table_info(chunks)")}
+        document_columns = {r["name"] for r in con.execute("PRAGMA table_info(documents)")}
+        if "dense_vector" not in chunk_columns:
+            con.execute("ALTER TABLE chunks ADD COLUMN dense_vector TEXT")
+        if "sparse_vector" not in chunk_columns:
+            con.execute("ALTER TABLE chunks ADD COLUMN sparse_vector TEXT")
+        if "vector_indexed" not in chunk_columns:
+            con.execute("ALTER TABLE chunks ADD COLUMN vector_indexed INTEGER NOT NULL DEFAULT 0")
+        if "source_object" not in document_columns:
+            con.execute("ALTER TABLE documents ADD COLUMN source_object TEXT")
         for role_id, label in [("user", "普通用户"), ("knowledge_admin", "知识管理员"),
                                ("system_admin", "系统管理员"), ("management", "管理层")]:
             permissions = json.dumps(BUILTIN_PERMISSIONS[role_id])
@@ -114,24 +164,95 @@ def init_db():
             ]
             for title, filename, category, content, permissions in samples:
                 doc_id = str(uuid.uuid4())
-                con.execute("INSERT INTO documents VALUES(?,?,?,?,?,1,?)", (doc_id, title, filename, category, content, time.time()))
+                con.execute("INSERT INTO documents(id,title,filename,category,content,enabled,created) VALUES(?,?,?,?,?,1,?)",
+                            (doc_id, title, filename, category, content, time.time()))
                 con.executemany("INSERT INTO acl VALUES(?,?,?)", [(doc_id, *p) for p in permissions])
                 for i, chunk in enumerate(split_text(content)):
-                    con.execute("INSERT INTO chunks VALUES(?,?,?,?)", (str(uuid.uuid4()), doc_id, i, chunk))
+                    vector = encode_documents([chunk])[0]
+                    con.execute("INSERT INTO chunks(id,document_id,ordinal,content,dense_vector,sparse_vector) VALUES(?,?,?,?,?,?)",
+                                (str(uuid.uuid4()), doc_id, i, chunk,
+                                 json.dumps(vector["dense"]), json.dumps(vector["sparse"])))
+        for row in con.execute("SELECT id,content FROM chunks WHERE dense_vector IS NULL").fetchall():
+            vector = encode_documents([row["content"]])[0]
+            con.execute("UPDATE chunks SET dense_vector=?,sparse_vector=? WHERE id=?",
+                        (json.dumps(vector["dense"]), json.dumps(vector["sparse"]), row["id"]))
 
 
 def split_text(text, size=700):
-    parts = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-    chunks = []
-    for part in parts:
-        while len(part) > size:
-            cut = part.rfind("。", 0, size)
-            cut = cut + 1 if cut > size // 2 else size
-            chunks.append(part[:cut].strip())
-            part = part[cut:].strip()
-        if part:
-            chunks.append(part)
-    return chunks or ([text.strip()] if text.strip() else [])
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    sections, hierarchy, body = [], [""] * 6, []
+    in_fence = False
+
+    def flush():
+        content = "\n".join([*(item for item in hierarchy if item), *body]).strip()
+        if content:
+            sections.append(content)
+        body.clear()
+
+    for line in text.splitlines():
+        if line.lstrip().startswith((chr(96) * 3, "~~~")):
+            in_fence = not in_fence
+        heading = None if in_fence else re.match(r"^\s*(#{1,6})\s+.+", line)
+        if heading:
+            if body:
+                flush()
+            level = len(heading.group(1))
+            hierarchy[level - 1] = line.strip()
+            hierarchy[level:] = [""] * (6 - level)
+        else:
+            body.append(line)
+    flush()
+    splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", "。", "！", "？", ".", ",", " ", ""],
+        chunk_size=size, chunk_overlap=min(80, size // 8), keep_separator=True)
+    return [chunk for section in sections for chunk in splitter.split_text(section)] or (
+        [text.strip()] if text.strip() else [])
+
+
+def repair_corrupt_documents():
+    """Rebuild documents imported with broken PDF text extraction."""
+    with db() as con:
+        documents = con.execute("SELECT id,filename FROM documents WHERE content LIKE '%�%'").fetchall()
+    for document in documents:
+        source = next((path for path in UPLOADS.glob(f"{document['id']}.*") if path.is_file()), None)
+        if not source:
+            continue
+        try:
+            text = validate_extracted_text(extract_file(document["filename"], source.read_bytes()), document["filename"])
+            chunks = split_text(text)
+            vectors = encode_documents(chunks)
+            with db() as con:
+                con.execute("UPDATE documents SET content=? WHERE id=?", (text, document["id"]))
+                con.execute("DELETE FROM chunks WHERE document_id=?", (document["id"],))
+                con.executemany("INSERT INTO chunks(id,document_id,ordinal,content,dense_vector,sparse_vector) VALUES(?,?,?,?,?,?)", [
+                    (str(uuid.uuid4()), document["id"], index, chunk,
+                     json.dumps(vector["dense"]), json.dumps(vector["sparse"]))
+                    for index, (chunk, vector) in enumerate(zip(chunks, vectors))])
+            logger.info("Repaired corrupt document id=%s chunks=%s", document["id"], len(chunks),
+                        extra={"request_id": "startup"})
+        except Exception:
+            logger.exception("Failed to repair corrupt document id=%s", document["id"],
+                             extra={"request_id": "startup"})
+
+
+def sync_pending_chunks():
+    with db() as con:
+        rows = con.execute(
+            "SELECT id,document_id,ordinal,dense_vector,sparse_vector FROM chunks WHERE vector_indexed=0"
+        ).fetchall()
+    if not rows:
+        return
+    records = [{
+        "chunk_id": row["id"], "document_id": row["document_id"],
+        "dense_vector": json.loads(row["dense_vector"]),
+        "sparse_vector": json.loads(row["sparse_vector"]) if row["sparse_vector"] else {},
+    } for row in rows]
+    rag_service.upsert_vectors(records)
+    with db() as con:
+        con.executemany(
+            "UPDATE chunks SET vector_indexed=1 WHERE id=? AND dense_vector=? AND coalesce(sparse_vector,'')=coalesce(?,'')",
+            [(row["id"], row["dense_vector"], row["sparse_vector"]) for row in rows])
 
 
 def row_user(row):
@@ -207,6 +328,22 @@ class FAQUpdate(BaseModel):
 @app.on_event("startup")
 def startup():
     init_db()
+    repair_corrupt_documents()
+
+
+@app.middleware("http")
+async def log_unhandled_errors(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("Unhandled request error method=%s path=%s", request.method, request.url.path,
+                         extra={"request_id": request_id})
+        from fastapi.responses import JSONResponse
+        response = JSONResponse(status_code=500, content={
+            "detail": f"请求失败，错误编号：{request_id}", "request_id": request_id})
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 @app.get("/api/health")
@@ -245,14 +382,51 @@ def extract_file(filename, raw):
     if suffix in {".txt", ".md"}:
         return raw.decode("utf-8-sig", errors="replace")
     if suffix == ".pdf":
+        command = os.getenv("MINERU_COMMAND", "mineru")
+        mineru = command if Path(command).is_file() else shutil.which(command)
+        if mineru:
+            with tempfile.TemporaryDirectory(prefix="kb-mineru-") as temp_dir:
+                source = Path(temp_dir) / Path(filename).name
+                output = Path(temp_dir) / "output"
+                source.write_bytes(raw)
+                try:
+                    result = subprocess.run(
+                        [mineru, "-p", str(source), "-o", str(output), "--backend", "pipeline"],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace",
+                        timeout=int(os.getenv("KB_MINERU_TIMEOUT", "900")), check=False)
+                except subprocess.TimeoutExpired:
+                    logger.warning("MinerU timed out; using PDF text fallback",
+                                   extra={"request_id": "mineru"})
+                else:
+                    markdown = output / source.stem / "auto" / f"{source.stem}.md"
+                    if result.returncode == 0 and markdown.is_file():
+                        return markdown.read_text(encoding="utf-8", errors="replace")
+                    logger.warning("MinerU failed exit_code=%s; using PDF text fallback",
+                                   result.returncode, extra={"request_id": "mineru"})
+        else:
+            logger.info("MinerU CLI unavailable; using PDF text fallback",
+                        extra={"request_id": "mineru"})
         from pypdf import PdfReader
         import io
-        return "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(raw)).pages)
+        pages = PdfReader(io.BytesIO(raw)).pages
+        text = "\n".join(page.extract_text() or "" for page in pages)
+        if text.count("�") > max(3, len(text) // 200):
+            text = "\n".join(page.extract_text(extraction_mode="layout") or "" for page in pages)
+        return text
     if suffix == ".docx":
         from docx import Document
         import io
         return "\n".join(p.text for p in Document(io.BytesIO(raw)).paragraphs)
     raise HTTPException(415, "仅支持 PDF、Markdown、Word、TXT")
+
+
+def validate_extracted_text(text, filename):
+    text = re.sub(r"\x00", "", text).strip()
+    if not text:
+        raise HTTPException(400, f"文件未提取到文本: {filename}")
+    if text.count("�") > max(3, len(text) // 200):
+        raise HTTPException(422, f"文件文本编码异常，无法可靠解析: {filename}")
+    return text
 
 
 def words(text):
@@ -267,41 +441,184 @@ def words(text):
     return result
 
 
+def question_similarity(left, right):
+    """Small dependency-free similarity score for FAQ clustering and cache lookup."""
+    left = re.sub(r"\W", "", left.lower())
+    right = re.sub(r"\W", "", right.lower())
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    left_words, right_words = words(left), words(right)
+    word_score = len(left_words & right_words) / max(1, len(left_words | right_words))
+    left_bigrams = {left[i:i + 2] for i in range(len(left) - 1)}
+    right_bigrams = {right[i:i + 2] for i in range(len(right) - 1)}
+    char_score = len(left_bigrams & right_bigrams) / max(1, len(left_bigrams | right_bigrams))
+    return max(word_score, char_score, SequenceMatcher(None, left, right).ratio())
+
+
+def build_grounded_answer(question, ranked):
+    """Compress retrieved chunks into relevant evidence instead of dumping whole chunks."""
+    qwords = words(question)
+    candidates = []
+    seen = set()
+    for chunk_score, _, _, chunk in ranked[:8]:
+        for sentence in re.split(r"(?<=[。！？.!?；;])\s*|\n+", chunk["content"]):
+            sentence = re.sub(r"\s+", " ", sentence).strip(" -·")
+            if len(sentence) < 12 or sentence in seen:
+                continue
+            seen.add(sentence)
+            overlap = len(qwords & words(sentence))
+            if overlap or chunk_score >= 0.4:
+                candidates.append((chunk_score + min(overlap, 8) * 0.03, sentence))
+    candidates.sort(reverse=True, key=lambda item: item[0])
+    selected = []
+    total = 0
+    for _, sentence in candidates:
+        if total + len(sentence) > 1400:
+            break
+        selected.append(sentence)
+        total += len(sentence) + 2
+        if len(selected) >= 5:
+            break
+    return "\n\n".join(selected)
+
+
 @app.post("/api/chat")
-def ask(body: Ask, user=Depends(require_permission("chat.access"))):
+def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: str | None = Header(default=None, alias="X-Request-ID")):
     started = time.perf_counter()
+    request_id = request_id or str(uuid.uuid4())
     question = body.question.strip()
-    with db() as con:
-        cached = con.execute("SELECT f.* FROM faq_cache c JOIN faqs f ON f.id=c.faq_id WHERE c.question=?", (question,)).fetchone()
-        rows = con.execute("SELECT c.id chunk_id,c.content,d.id document_id,d.title,d.filename,a.kind,a.subject FROM chunks c JOIN documents d ON d.id=c.document_id LEFT JOIN acl a ON a.document_id=d.id WHERE d.enabled=1 ORDER BY d.created DESC").fetchall()
+    if not question:
+        raise HTTPException(400, "Question cannot be empty")
+    external = rag_service.external_enabled()
+    try:
+        chat_stage(request_id, "正在准备知识库检索")
+        with db() as con:
+            cached_rows = con.execute("SELECT f.* FROM faq_cache c JOIN faqs f ON f.id=c.faq_id WHERE f.status='published' AND f.cache_enabled=1").fetchall()
+            cached = max(cached_rows, key=lambda row: question_similarity(question, row["question"]), default=None)
+            if cached and question_similarity(question, cached["question"]) < 0.55:
+                cached = None
+            rows = [] if external else con.execute(
+                "SELECT c.id chunk_id,c.content,c.dense_vector,c.sparse_vector,d.id document_id,d.title,d.filename,a.kind,a.subject "
+                "FROM chunks c JOIN documents d ON d.id=c.document_id LEFT JOIN acl a ON a.document_id=d.id "
+                "WHERE d.enabled=1 ORDER BY d.created DESC").fetchall()
+        candidate_ids = []
+        if external:
+            chat_stage(request_id, "正在同步待索引知识切片")
+            sync_pending_chunks()
+            chat_stage(request_id, "正在进行问题向量化")
+            direct_ids = rag_service.hybrid_search(encode_query(question))
+            chat_stage(request_id, "正在进行 Milvus 混合检索")
+            try:
+                chat_stage(request_id, "正在生成 HyDE 假设文档")
+                hyde = rag_service.generate_hypothetical_document(question)
+            except Exception:
+                hyde = ""
+                logger.exception("HyDE generation failed question_length=%s", len(question),
+                                 extra={"request_id": str(uuid.uuid4())})
+            hyde_ids = rag_service.hybrid_search(encode_query(question + "\n" + hyde)) if hyde else []
+            chat_stage(request_id, "正在进行 RRF 检索结果融合")
+            candidate_ids = rag_service.reciprocal_rank_fusion(direct_ids, hyde_ids)
+            if candidate_ids:
+                placeholders = ",".join("?" for _ in candidate_ids)
+                with db() as con:
+                    rows = con.execute(
+                        "SELECT c.id chunk_id,c.content,c.dense_vector,c.sparse_vector,d.id document_id,d.title,d.filename,"
+                        "a.kind,a.subject FROM chunks c JOIN documents d ON d.id=c.document_id "
+                        "LEFT JOIN acl a ON a.document_id=d.id "
+                        f"WHERE d.enabled=1 AND c.id IN ({placeholders})",
+                        candidate_ids).fetchall()
+    except Exception:
+        request_id = str(uuid.uuid4())
+        logger.exception("Chat retrieval failed question_length=%s", len(question), extra={"request_id": request_id})
+        raise HTTPException(500, f"问答检索失败，错误编号：{request_id}") from None
     by_doc = {}
+    chat_stage(request_id, "正在加载候选文档并进行权限过滤")
     for row in rows:
         item = by_doc.setdefault(row["document_id"], {"title": row["title"], "filename": row["filename"], "acl": [], "chunks": []})
         if row["kind"]:
             item["acl"].append((row["kind"], row["subject"]))
-        item["chunks"].append({"id": row["chunk_id"], "content": row["content"]})
-    qwords = words(question)
+        if not any(chunk["id"] == row["chunk_id"] for chunk in item["chunks"]):
+            item["chunks"].append({"id": row["chunk_id"], "content": row["content"],
+                                   "vector": json.loads(row["dense_vector"]) if row["dense_vector"] else None,
+                                   "sparse": json.loads(row["sparse_vector"]) if row["sparse_vector"] else None})
     ranked = []
     denied = []
-    for doc_id, doc in by_doc.items():
-        can_read = allowed_for(user, doc["acl"])
-        best = max(doc["chunks"], key=lambda c: len(qwords & words(c["content"])), default=None)
-        score = len(qwords & words(best["content"])) if best else 0
-        if score:
-            (ranked if can_read else denied).append((score, doc_id, doc, best))
-    ranked.sort(reverse=True, key=lambda x: x[0])
-    denied.sort(reverse=True, key=lambda x: x[0])
-    citations = [{"document_id": doc_id, "title": doc["title"], "filename": doc["filename"], "chunk_id": chunk["id"], "excerpt": chunk["content"][:260]}
-                 for _, doc_id, doc, chunk in ranked[:3]]
+    reranked = []
+    if external:
+        rank_by_id = {chunk_id: index for index, chunk_id in enumerate(candidate_ids)}
+        for doc_id, doc in by_doc.items():
+            can_read = allowed_for(user, doc["acl"])
+            for chunk in doc["chunks"]:
+                score = 1 / (60 + rank_by_id.get(chunk["id"], len(candidate_ids)))
+                target = ranked if can_read else denied
+                target.append((score, doc_id, doc, chunk))
+        ranked.sort(reverse=True, key=lambda item: item[0])
+        denied.sort(reverse=True, key=lambda item: item[0])
+        if denied:
+            cached = None
+        try:
+            chat_stage(request_id, "正在使用 BGE Reranker 重排结果")
+            reranked = rag_service.rerank(question, [{
+                "chunk_id": chunk["id"], "document_id": doc_id,
+                "title": doc["title"], "filename": doc["filename"], "content": chunk["content"],
+            } for _, doc_id, doc, chunk in ranked])
+            reranked = [item for item in reranked
+                        if item["score"] >= float(os.getenv("KB_RERANKER_MIN_SCORE", "0.2"))][:5]
+        except Exception:
+            request_id = str(uuid.uuid4())
+            logger.exception("Chat reranking failed question_length=%s", len(question),
+                             extra={"request_id": request_id})
+            raise HTTPException(500, f"问答重排失败，错误编号：{request_id}") from None
+    else:
+        qwords = words(question)
+        try:
+            query_vector = encode_query(question)
+        except Exception:
+            request_id = str(uuid.uuid4())
+            logger.exception("Chat embedding failed question_length=%s", len(question), extra={"request_id": request_id})
+            raise HTTPException(500, f"问题向量化失败，错误编号：{request_id}") from None
+        for doc_id, doc in by_doc.items():
+            can_read = allowed_for(user, doc["acl"])
+            for chunk in doc["chunks"]:
+                vector_score = cosine(query_vector["dense"], chunk["vector"]) if chunk["vector"] else 0
+                sparse_score = sparse_dot(query_vector["sparse"], chunk["sparse"])
+                keyword_score = len(qwords & words(chunk["content"]))
+                score = vector_score * 0.8 + min(sparse_score, 1) * 0.15 + min(keyword_score, 5) * 0.01
+                if score >= 0.25 or keyword_score:
+                    (ranked if can_read else denied).append((score, doc_id, doc, chunk))
+        ranked.sort(reverse=True, key=lambda item: item[0])
+        denied.sort(reverse=True, key=lambda item: item[0])
+    if denied:
+        cached = None
+    citations = ([{"document_id": item["document_id"], "title": item["title"], "filename": item["filename"],
+                   "chunk_id": item["chunk_id"], "excerpt": item["content"][:700]} for item in reranked]
+                 if external else
+                 [{"document_id": doc_id, "title": doc["title"], "filename": doc["filename"],
+                   "chunk_id": chunk["id"], "excerpt": chunk["content"][:700]}
+                  for _, doc_id, doc, chunk in ranked[:5]])
     if cached:
+        chat_stage(request_id, "命中 FAQ 缓存，正在返回答案")
         answer = cached["answer"]
     elif citations:
-        answer = "\n\n".join(f"{i}. {c['excerpt']}" for i, c in enumerate(citations, 1))
+        if external:
+            try:
+                chat_stage(request_id, "正在根据授权切片生成答案")
+                answer = rag_service.generate_answer(question, reranked)
+            except Exception:
+                request_id = str(uuid.uuid4())
+                logger.exception("Chat answer generation failed question_length=%s", len(question),
+                                 extra={"request_id": request_id})
+                raise HTTPException(500, f"答案生成失败，错误编号：{request_id}") from None
+        else:
+            answer = build_grounded_answer(question, ranked) or citations[0]["excerpt"]
     else:
         answer = "目前没有检索到可用于回答的知识内容。问题已记录到知识缺口，管理员可据此补充资料。"
     if denied:
         answer += "\n\n部分参考资料因权限受限无法展示。"
     elapsed = int((time.perf_counter() - started) * 1000)
+    chat_stage(request_id, "问答处理完成")
     chat_id = str(uuid.uuid4())
     with db() as con:
         con.execute("INSERT INTO chats VALUES(?,?,?,?,?,?,?,?,?,?,?)", (chat_id, body.session_id or str(uuid.uuid4()),
@@ -312,10 +629,52 @@ def ask(body: Ask, user=Depends(require_permission("chat.access"))):
             con.execute("INSERT INTO gaps(id,question,user_id,department_id,created) VALUES(?,?,?,?,?) ON CONFLICT(question) DO UPDATE SET count=count+1",
                         (str(uuid.uuid4()), question, user["id"], user["department_id"], time.time()))
         if not cached:
-            con.execute("INSERT INTO faqs(id,question,answer,status,count,created) VALUES(?,?,?,?,1,?) ON CONFLICT(question) DO UPDATE SET count=count+1",
-                        (str(uuid.uuid4()), question, answer, "candidate", time.time()))
+            candidates = con.execute("SELECT id,question FROM faqs").fetchall()
+            exact = next((row for row in candidates if row["question"] == question), None)
+            match = exact or max((row for row in candidates if row["question"] != question),
+                                 key=lambda row: question_similarity(question, row["question"]), default=None)
+            if match and question_similarity(question, match["question"]) >= 0.55:
+                con.execute("UPDATE faqs SET count=count+1 WHERE id=?", (match["id"],))
+            else:
+                con.execute("INSERT INTO faqs(id,question,answer,status,count,created,cache_enabled) VALUES(?,?,?,?,1,?,0)",
+                            (str(uuid.uuid4()), question, answer, "candidate", time.time()))
     return {"id": chat_id, "question": question, "answer": answer, "citations": citations,
             "restricted": bool(denied), "faq_hit": bool(cached), "latency_ms": elapsed}
+
+
+@app.post("/api/chat/stream")
+async def ask_stream(body: Ask, user=Depends(require_permission("chat.access"))):
+    request_id = str(uuid.uuid4())
+    queue = asyncio.Queue()
+    _chat_streams[request_id] = queue
+
+    async def run():
+        try:
+            result = await asyncio.to_thread(ask, body, user, request_id)
+            for offset in range(0, len(result["answer"]), 32):
+                await queue.put({"type": "token", "text": result["answer"][offset:offset + 32]})
+            await queue.put({"type": "answer", "answer": result})
+        except Exception as exc:
+            logger.exception("Chat stream failed", extra={"request_id": request_id})
+            await queue.put({"type": "error", "message": str(exc)})
+        finally:
+            await queue.put({"type": "done"})
+
+    asyncio.create_task(run())
+
+    async def stream():
+        try:
+            while True:
+                event = await queue.get()
+                event["request_id"] = request_id
+                yield f"event: chat\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event["type"] == "done":
+                    break
+        finally:
+            _chat_streams.pop(request_id, None)
+
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/dashboard")
@@ -341,22 +700,46 @@ def faqs(user=Depends(require_permission("curation.manage"))):
 
 @app.put("/api/faqs/{faq_id}")
 def update_faq(faq_id: str, body: FAQUpdate, user=Depends(require_permission("curation.manage"))):
+    question, answer = body.question.strip(), body.answer.strip()
+    if not question:
+        raise HTTPException(400, "FAQ question cannot be empty")
+    if body.status == "published" and not answer:
+        raise HTTPException(400, "Published FAQ requires an answer")
     if body.status not in {"candidate", "published", "rejected"}:
         raise HTTPException(400, "FAQ状态无效")
     with db() as con:
-        cur = con.execute("UPDATE faqs SET question=?,answer=?,status=? WHERE id=?", (body.question, body.answer, body.status, faq_id))
+        cur = con.execute("UPDATE faqs SET question=?,answer=?,status=? WHERE id=?", (question, answer, body.status, faq_id))
         if not cur.rowcount:
             raise HTTPException(404, "FAQ不存在")
         con.execute("DELETE FROM faq_cache WHERE faq_id=?", (faq_id,))
         if body.status == "published":
-            con.execute("INSERT OR REPLACE INTO faq_cache VALUES(?,?)", (body.question, faq_id))
+            con.execute("INSERT OR REPLACE INTO faq_cache VALUES(?,?)", (question, faq_id))
+            con.execute("UPDATE faqs SET cache_enabled=1 WHERE id=?", (faq_id,))
+        else:
+            con.execute("UPDATE faqs SET cache_enabled=0 WHERE id=?", (faq_id,))
     return {"ok": True}
+
+
+@app.put("/api/faqs/{faq_id}/cache")
+def update_faq_cache(faq_id: str, body: dict, user=Depends(require_permission("curation.manage"))):
+    enabled = bool(body.get("enabled"))
+    with db() as con:
+        faq = con.execute("SELECT question,status FROM faqs WHERE id=?", (faq_id,)).fetchone()
+        if not faq:
+            raise HTTPException(404, "FAQ not found")
+        if enabled and faq["status"] != "published":
+            raise HTTPException(400, "Only published FAQ can enable cache")
+        con.execute("UPDATE faqs SET cache_enabled=? WHERE id=?", (int(enabled), faq_id))
+        con.execute("DELETE FROM faq_cache WHERE faq_id=?", (faq_id,))
+        if enabled:
+            con.execute("INSERT OR REPLACE INTO faq_cache VALUES(?,?)", (faq["question"], faq_id))
+    return {"ok": True, "enabled": enabled}
 
 
 @app.get("/api/gaps")
 def gaps(user=Depends(require_permission("curation.manage"))):
     with db() as con:
-        return [dict(r) for r in con.execute("SELECT g.*,d.name department FROM gaps g LEFT JOIN departments d ON d.id=g.department_id ORDER BY count DESC,created DESC")]
+        return [dict(r) for r in con.execute("SELECT g.*,d.name department,t.id task_id FROM gaps g LEFT JOIN departments d ON d.id=g.department_id LEFT JOIN knowledge_tasks t ON t.gap_id=g.id ORDER BY g.count DESC,g.created DESC")]
 
 
 @app.put("/api/gaps/{gap_id}")
@@ -365,8 +748,25 @@ def update_gap(gap_id: str, body: dict, user=Depends(require_permission("curatio
     if status not in {"open", "in_progress", "resolved"}:
         raise HTTPException(400, "状态无效")
     with db() as con:
-        con.execute("UPDATE gaps SET status=? WHERE id=?", (status, gap_id))
+        cur = con.execute("UPDATE gaps SET status=? WHERE id=?", (status, gap_id))
+        if not cur.rowcount:
+            raise HTTPException(404, "Knowledge gap not found")
     return {"ok": True}
+
+
+@app.post("/api/gaps/{gap_id}/task")
+def create_gap_task(gap_id: str, user=Depends(require_permission("curation.manage"))):
+    with db() as con:
+        gap = con.execute("SELECT question FROM gaps WHERE id=?", (gap_id,)).fetchone()
+        if not gap:
+            raise HTTPException(404, "Knowledge gap not found")
+        task = con.execute("SELECT * FROM knowledge_tasks WHERE gap_id=?", (gap_id,)).fetchone()
+        if task:
+            return dict(task)
+        task_id = str(uuid.uuid4())
+        con.execute("INSERT INTO knowledge_tasks VALUES(?,?,?,?,?)",
+                    (task_id, gap_id, "补充知识：" + gap["question"], "open", time.time()))
+        return dict(con.execute("SELECT * FROM knowledge_tasks WHERE id=?", (task_id,)).fetchone())
 
 
 @app.get("/")
@@ -375,7 +775,8 @@ def index():
 
 
 register_documents_router(app, db=db, require_permission=require_permission,
-                         extract_file=extract_file, split_text=split_text, uploads=UPLOADS)
+                         extract_file=extract_file, validate_text=validate_extracted_text,
+                         split_text=split_text, uploads=UPLOADS)
 register_organization_router(app, db=db, current_user=current_user,
                              require_permission=require_permission, require_any_permission=require_any_permission,
                              row_user=row_user, password_hash=password_hash,

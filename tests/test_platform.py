@@ -7,6 +7,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -15,6 +16,8 @@ class PlatformFlowTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         os.environ["KB_DB_PATH"] = os.path.join(self.temp.name, "test.db")
+        os.environ["KB_EMBEDDING_BACKEND"] = "hash"
+        os.environ["KB_RAG_BACKEND"] = "sqlite"
         import main
         main.DB_PATH = os.environ["KB_DB_PATH"]
         self.app = main.app
@@ -25,6 +28,8 @@ class PlatformFlowTest(unittest.TestCase):
         self.client.__exit__(None, None, None)
         self.temp.cleanup()
         os.environ.pop("KB_DB_PATH", None)
+        os.environ.pop("KB_EMBEDDING_BACKEND", None)
+        os.environ.pop("KB_RAG_BACKEND", None)
 
     def login(self, username, password):
         response = self.client.post("/api/login", json={"username": username, "password": password})
@@ -50,12 +55,39 @@ class PlatformFlowTest(unittest.TestCase):
         self.assertTrue(cached["faq_hit"])
         self.assertEqual(cached["answer"], "已审核标准答案")
 
+        similar = self.client.post("/api/chat", headers=admin, json={"question": faq["question"] + "？"}).json()
+        self.assertTrue(similar["faq_hit"])
+        self.assertEqual(similar["answer"], "已审核标准答案")
+        self.assertEqual(self.client.put(f"/api/faqs/{faq_id}/cache", headers=admin,
+                                         json={"enabled": False}).status_code, 200)
+        disabled = self.client.post("/api/chat", headers=admin, json={"question": faq["question"]}).json()
+        self.assertFalse(disabled["faq_hit"])
+
     def test_miss_creates_gap(self):
         finance = self.login("finance", "Finance123!")
-        self.client.post("/api/chat", headers=finance, json={"question": "火星基地供水系统方案"})
+        response = self.client.post("/api/chat", headers=finance, json={"question": "火星基地供水系统方案"})
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.json()["citations"])
         admin = self.login("admin", "Admin123!")
         gaps = self.client.get("/api/gaps", headers=admin).json()
-        self.assertTrue(any(x["question"] == "火星基地供水系统方案" for x in gaps))
+        gap = next(x for x in gaps if x["question"] == "火星基地供水系统方案")
+        task = self.client.post(f"/api/gaps/{gap['id']}/task", headers=admin)
+        self.assertEqual(task.status_code, 200)
+        self.assertEqual(self.client.post(f"/api/gaps/{gap['id']}/task", headers=admin).json()["id"], task.json()["id"])
+        self.assertEqual(next(x for x in self.client.get("/api/gaps", headers=admin).json()
+                              if x["id"] == gap["id"])["task_id"], task.json()["id"])
+
+    def test_similar_questions_cluster_into_one_candidate(self):
+        staff = self.login("staff", "Staff123!")
+        admin = self.login("admin", "Admin123!")
+        first = "海外直邮清关延误怎么办"
+        second = "海外直邮清关延误了怎么办"
+        self.client.post("/api/chat", headers=staff, json={"question": first})
+        self.client.post("/api/chat", headers=staff, json={"question": second})
+        matches = [faq for faq in self.client.get("/api/faqs", headers=admin).json()
+                   if faq["question"] in {first, second}]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["count"], 2)
 
     def test_document_edit_disable_and_permissions(self):
         admin = self.login("admin", "Admin123!")
@@ -190,6 +222,77 @@ class PlatformFlowTest(unittest.TestCase):
             "name": "系统管理员", "permissions": ["chat.access"]})
         self.assertEqual(failed.status_code, 409)
         self.assertIn("organization.manage", self.client.get("/api/me", headers=admin).json()["permissions"])
+
+    def test_acl_and_curation_validate_references(self):
+        admin = self.login("admin", "Admin123!")
+        doc = self.client.get("/api/documents", headers=admin).json()[0]
+        self.assertEqual(self.client.put(f"/api/documents/{doc['id']}/acl", headers=admin, json={
+            "permissions": [{"kind": "role", "subject": "missing-role"}]}).status_code, 400)
+        self.client.post("/api/chat", headers=admin, json={"question": "validation faq seed"})
+        faq = self.client.get("/api/faqs", headers=admin).json()[0]
+        self.assertEqual(self.client.put(f"/api/faqs/{faq['id']}", headers=admin, json={
+            "question": faq["question"], "answer": "", "status": "published"}).status_code, 400)
+        self.assertEqual(self.client.put("/api/gaps/missing", headers=admin,
+                                         json={"status": "resolved"}).status_code, 404)
+
+    def test_import_embedding_failure_is_logged_with_error_id(self):
+        import main
+        log_path = main.LOGS / "app.log"
+        with patch("api.documents_router.encode_documents", side_effect=RuntimeError("model unavailable")):
+            response = self.client.post("/api/documents/import", headers=self.login("admin", "Admin123!"),
+                                        files={"files": ("failure.txt", b"diagnostic test", "text/plain")})
+        self.assertEqual(response.status_code, 500)
+        request_id = response.json()["detail"].split("：")[-1]
+        log = log_path.read_text(encoding="utf-8")
+        self.assertIn(request_id, log)
+        self.assertIn("Document import failed", log)
+
+    def test_remote_candidates_are_authorized_before_rerank_and_generation(self):
+        import main
+        with main.db() as con:
+            allowed_id = con.execute(
+                "SELECT c.id FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.title='差旅报销标准'"
+            ).fetchone()["id"]
+            restricted_id = con.execute(
+                "SELECT c.id FROM chunks c JOIN documents d ON d.id=c.document_id WHERE d.title='高管薪酬与股权激励细则'"
+            ).fetchone()["id"]
+        os.environ["KB_RAG_BACKEND"] = "milvus"
+
+        def check_rerank(question, documents):
+            self.assertEqual(len(documents), 1)
+            self.assertNotIn("薪酬", documents[0]["content"])
+            return [{**documents[0], "score": 0.9}]
+
+        with patch("main.rag_service.upsert_vectors"), \
+             patch("main.rag_service.hybrid_search",
+                   side_effect=[[allowed_id, restricted_id], [allowed_id, restricted_id]]), \
+             patch("main.rag_service.generate_hypothetical_document", return_value="差旅报销规定"), \
+             patch("main.rag_service.rerank", side_effect=check_rerank), \
+             patch("main.rag_service.generate_answer", return_value="出差后十个工作日内提交报销单 [1]"):
+            response = self.client.post(
+                "/api/chat", headers=self.login("staff", "Staff123!"),
+                json={"question": "差旅报销流程是什么"})
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["restricted"])
+        self.assertEqual(len(response.json()["citations"]), 1)
+        self.assertNotIn("薪酬", response.json()["answer"])
+
+    def test_markdown_split_keeps_heading_context(self):
+        import main
+        chunks = main.split_text(
+            "# HAK 180\n## 安全操作\n设备运行前检查防护罩。操作结束后切断电源。", size=80)
+        self.assertTrue(chunks)
+        self.assertTrue(all("# HAK 180" in chunk and "## 安全操作" in chunk for chunk in chunks))
+
+    def test_imported_document_is_retrieved_from_multiple_chunks(self):
+        headers = self.login("admin", "Admin123!")
+        response = self.client.post("/api/documents/import", headers=headers,
+                                    files={"files": ("manual.txt", b"Device model HAK 180 supports foil printing.\n\nThe device uses a temperature control panel.", "text/plain")})
+        self.assertEqual(response.status_code, 200)
+        result = self.client.post("/api/chat", headers=headers, json={"question": "temperature control panel"}).json()
+        self.assertTrue(result["citations"])
+        self.assertIn("temperature", result["answer"].lower())
+        self.assertLess(len(result["answer"]), 500)
 
     def test_old_roles_table_migrates_permissions_column(self):
         import main
