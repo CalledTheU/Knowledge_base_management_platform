@@ -6,7 +6,9 @@ import os
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -45,8 +47,10 @@ class PlatformFlowTest(unittest.TestCase):
         self.assertNotIn("薪酬委员会审核", denied["answer"])
         allowed = self.client.post("/api/chat", headers=finance, json={"question": "差旅报销标准"}).json()
         self.assertTrue(allowed["citations"])
+        self.client.post("/api/chat", headers=finance, json={"question": allowed["question"]})
 
         admin = self.login("admin", "Admin123!")
+        self.assertEqual(self.client.post("/api/faqs/refresh", headers=admin, json={}).json()["created"], 1)
         faq_id = self.client.get("/api/faqs", headers=admin).json()[0]["id"]
         faq = self.client.get("/api/faqs", headers=admin).json()[0]
         self.client.put(f"/api/faqs/{faq_id}", headers=admin, json={"question": faq["question"],
@@ -78,16 +82,33 @@ class PlatformFlowTest(unittest.TestCase):
                               if x["id"] == gap["id"])["task_id"], task.json()["id"])
 
     def test_similar_questions_cluster_into_one_candidate(self):
-        staff = self.login("staff", "Staff123!")
         admin = self.login("admin", "Admin123!")
-        first = "海外直邮清关延误怎么办"
-        second = "海外直邮清关延误了怎么办"
-        self.client.post("/api/chat", headers=staff, json={"question": first})
-        self.client.post("/api/chat", headers=staff, json={"question": second})
+        import main
+        first = "员工出差前要提交什么申请"
+        second = "出差前需要提交什么申请"
+        with main.db() as con:
+            user_id = con.execute("SELECT id FROM users WHERE username='staff'").fetchone()["id"]
+            global_doc = con.execute("SELECT document_id FROM acl WHERE kind='global' AND subject='*' LIMIT 1").fetchone()["document_id"]
+            private_doc = con.execute("SELECT document_id FROM acl WHERE kind='role' AND subject='user' LIMIT 1").fetchone()["document_id"]
+            for index, question in enumerate((first, second)):
+                con.execute("INSERT INTO chats(id,session_id,user_id,question,answer,retrieved,allowed,denied,tokens,latency_ms,created,faq_hit) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)",
+                            (str(uuid.uuid4()), "faq-global", user_id, question, "grounded answer", "[]",
+                             json.dumps([global_doc]), "[]", 5, 10, time.time() + index))
+            for index in range(2):
+                con.execute("INSERT INTO chats(id,session_id,user_id,question,answer,retrieved,allowed,denied,tokens,latency_ms,created,faq_hit) VALUES(?,?,?,?,?,?,?,?,?,?,?,0)",
+                            (str(uuid.uuid4()), "faq-private", user_id, "private restricted question", "private answer", "[]",
+                             json.dumps([private_doc]), "[]", 5, 10, time.time() + 10 + index))
+        refresh = self.client.post("/api/faqs/refresh", headers=admin, json={}).json()
+        self.assertEqual(refresh["created"], 1)
         matches = [faq for faq in self.client.get("/api/faqs", headers=admin).json()
                    if faq["question"] in {first, second}]
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["count"], 2)
+        self.assertFalse(any(faq["question"] == "private restricted question"
+                             for faq in self.client.get("/api/faqs", headers=admin).json()))
+        self.assertEqual(self.client.post("/api/faqs/refresh", headers=admin, json={}).json()["created"], 0)
+        self.assertEqual(next(f for f in self.client.get("/api/faqs", headers=admin).json()
+                              if f["id"] == matches[0]["id"])["count"], 2)
 
     def test_document_edit_disable_and_permissions(self):
         admin = self.login("admin", "Admin123!")
@@ -228,7 +249,9 @@ class PlatformFlowTest(unittest.TestCase):
         doc = self.client.get("/api/documents", headers=admin).json()[0]
         self.assertEqual(self.client.put(f"/api/documents/{doc['id']}/acl", headers=admin, json={
             "permissions": [{"kind": "role", "subject": "missing-role"}]}).status_code, 400)
-        self.client.post("/api/chat", headers=admin, json={"question": "validation faq seed"})
+        self.client.post("/api/chat", headers=admin, json={"question": "差旅报销标准"})
+        self.client.post("/api/chat", headers=admin, json={"question": "差旅报销标准"})
+        self.client.post("/api/faqs/refresh", headers=admin, json={})
         faq = self.client.get("/api/faqs", headers=admin).json()[0]
         self.assertEqual(self.client.put(f"/api/faqs/{faq['id']}", headers=admin, json={
             "question": faq["question"], "answer": "", "status": "published"}).status_code, 400)
@@ -294,6 +317,61 @@ class PlatformFlowTest(unittest.TestCase):
         self.assertIn("temperature", result["answer"].lower())
         self.assertLess(len(result["answer"]), 500)
 
+    def test_chat_history_is_persistent_and_user_scoped(self):
+        staff = self.login("staff", "Staff123!")
+        session_id = "history-session"
+        first = self.client.post("/api/chat", headers=staff, json={
+            "question": "travel policy", "session_id": session_id}).json()
+        second = self.client.post("/api/chat", headers=staff, json={
+            "question": "what about lodging?", "session_id": session_id}).json()
+        self.assertEqual(second["history"][-1]["question"], first["question"])
+        sessions = self.client.get("/api/chat/sessions", headers=staff).json()
+        self.assertEqual(next(s for s in sessions if s["session_id"] == session_id)["messages"], 2)
+        restored = self.client.get(f"/api/chat/sessions/{session_id}", headers=staff).json()
+        self.assertEqual(len(restored["messages"]), 2)
+        admin = self.login("admin", "Admin123!")
+        self.assertEqual(self.client.get(f"/api/chat/sessions/{session_id}", headers=admin).json()["messages"], [])
+        import main
+        with main.db() as con:
+            private = con.execute("SELECT id,title FROM documents WHERE title='高管薪酬与股权激励细则'").fetchone()
+        restricted_session = "restricted-history"
+        old_answer = self.client.post("/api/chat", headers=admin, json={
+            "question": private["title"], "session_id": restricted_session}).json()
+        self.assertTrue(old_answer["citations"])
+        self.client.put(f"/api/documents/{private['id']}/acl", headers=admin, json={
+            "permissions": [{"kind": "department", "subject": "dept-finance"}]})
+        self.assertEqual(self.client.get(f"/api/chat/sessions/{restricted_session}", headers=admin).json()["messages"], [])
+        follow_up = self.client.post("/api/chat", headers=admin, json={
+            "question": "what are the details?", "session_id": restricted_session}).json()
+        self.assertEqual(follow_up["history"], [])
+
+    def test_answer_prompt_receives_multi_turn_context(self):
+        from types import SimpleNamespace
+        import services.rag_service as rag
+        with patch("services.rag_service._get_llm") as get_llm:
+            get_llm.return_value.invoke.return_value = SimpleNamespace(content="grounded answer")
+            answer = rag.generate_answer("follow-up", [{"title": "Policy", "content": "Evidence."}],
+                                         history="User: initial question\nAssistant: prior answer")
+        prompt = get_llm.return_value.invoke.call_args.args[0]
+        self.assertEqual(answer, "grounded answer")
+        self.assertIn("initial question", prompt[1].content)
+        self.assertIn("Current question", prompt[1].content)
+
+    def test_dashboard_returns_trends_and_measured_faq_hits(self):
+        admin = self.login("admin", "Admin123!")
+        self.client.post("/api/chat", headers=admin, json={"question": "差旅报销标准"})
+        self.client.post("/api/chat", headers=admin, json={"question": "差旅报销标准"})
+        self.client.post("/api/faqs/refresh", headers=admin, json={})
+        faq = self.client.get("/api/faqs", headers=admin).json()[0]
+        self.client.put(f"/api/faqs/{faq['id']}", headers=admin, json={
+            "question": faq["question"], "answer": "standard answer", "status": "published"})
+        self.client.post("/api/chat", headers=admin, json={"question": faq["question"]})
+        dashboard = self.client.get("/api/dashboard", headers=admin).json()
+        self.assertTrue(dashboard["daily"])
+        self.assertEqual(sum(x["count"] for x in dashboard["latency_distribution"]), dashboard["questions"])
+        self.assertEqual(dashboard["faq_hits"], 1)
+        self.assertGreater(dashboard["faq_hit_rate"], 0)
+
     def test_old_roles_table_migrates_permissions_column(self):
         import main
         original_path = main.DB_PATH
@@ -302,6 +380,8 @@ class PlatformFlowTest(unittest.TestCase):
             con = sqlite3.connect(legacy_path)
             try:
                 con.execute("CREATE TABLE roles(id TEXT PRIMARY KEY,name TEXT UNIQUE NOT NULL,built_in INTEGER NOT NULL DEFAULT 0)")
+                con.execute("CREATE TABLE chats(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,user_id TEXT NOT NULL,question TEXT NOT NULL,answer TEXT NOT NULL,retrieved TEXT NOT NULL,allowed TEXT NOT NULL,denied TEXT NOT NULL,tokens INTEGER NOT NULL,latency_ms INTEGER NOT NULL,created REAL NOT NULL)")
+                con.execute("CREATE TABLE faqs(id TEXT PRIMARY KEY,question TEXT NOT NULL UNIQUE,answer TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'candidate',count INTEGER NOT NULL DEFAULT 1,created REAL NOT NULL,cache_enabled INTEGER NOT NULL DEFAULT 0)")
             finally:
                 con.close()
             main.DB_PATH = legacy_path
@@ -310,6 +390,10 @@ class PlatformFlowTest(unittest.TestCase):
             try:
                 columns = {row[1] for row in con.execute("PRAGMA table_info(roles)")}
                 self.assertIn("permissions", columns)
+                chat_columns = {row[1] for row in con.execute("PRAGMA table_info(chats)")}
+                self.assertIn("faq_hit", chat_columns)
+                faq_columns = {row[1] for row in con.execute("PRAGMA table_info(faqs)")}
+                self.assertTrue({"source_documents", "confidence"}.issubset(faq_columns))
                 self.assertEqual(con.execute("SELECT count(*) FROM roles").fetchone()[0], 4)
                 self.assertEqual(json.loads(con.execute(
                     "SELECT permissions FROM roles WHERE id='user'").fetchone()[0]), ["chat.access"])

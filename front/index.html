@@ -33,6 +33,7 @@
         <div class="metric-grid" id="metrics"></div>
         <div class="dashboard-grid"><div class="panel"><div class="panel-head"><div><h2>高频提问</h2><p>按问题汇总的问答次数</p></div><span class="subtle">TOP 8</span></div><div id="top-questions" class="rank-list"></div></div>
           <div class="panel"><div class="panel-head"><div><h2>热门知识</h2><p>被问答引用最多的知识</p></div><span class="subtle">TOP 8</span></div><div id="top-knowledge" class="rank-list"></div></div></div>
+        <div class="dashboard-grid dashboard-trends"><div class="panel"><div class="panel-head"><div><h2>近 14 天问答趋势</h2><p>每日问答量与 Token 消耗</p></div></div><div id="daily-trend" class="trend-list"></div></div><div class="panel"><div class="panel-head"><div><h2>响应时延分布</h2><p>按请求耗时分桶</p></div><span id="faq-hit-rate" class="subtle"></span></div><div id="latency-trend" class="trend-list"></div></div></div>
       </section>
       <section id="view-documents" class="view" hidden>
         <div class="page-heading"><div><div class="eyebrow">知识资产</div><h1>知识维护</h1></div><label class="primary upload-button">＋ 导入文件<input id="upload-files" type="file" multiple accept=".pdf,.md,.txt,.docx"></label></div>
@@ -45,10 +46,10 @@
         <p id="chat-access-summary" class="chat-access-summary" hidden></p>
         <div class="chat-layout"><div class="chat-main"><div id="chat-messages" class="messages"><div class="welcome"><div class="welcome-icon">✳</div><h2>有什么知识问题？</h2><p>回答只会使用当前账号有权访问的知识。</p><div class="suggestions"><button>差旅报销需要哪些材料？</button><button>商品破损如何申请退款？</button><button>高管薪酬政策是什么？</button></div></div></div>
           <form id="ask-form" class="ask-form"><textarea id="question" rows="1" placeholder="输入问题，按 Enter 发送" required></textarea><button class="send-button" title="发送" aria-label="发送">↑</button></form><div class="chat-disclaimer">回答由知识库内容生成，请核对引用来源。</div></div>
-          <aside class="chat-aside"><h3>当前身份</h3><div class="identity-card"><span id="chat-avatar" class="avatar large">王</span><div><b id="chat-user"></b><span id="chat-dept"></span></div></div><div class="aside-rule"></div><h3>最近引用</h3><div id="recent-citations" class="recent-citations"><div class="empty-small">本次对话的引用将显示在这里</div></div><div id="restricted-note" class="restricted-note" hidden>部分匹配资料因权限受限无法展示。</div></aside></div>
+          <aside class="chat-aside"><h3>历史会话</h3><div id="chat-sessions" class="session-list"><div class="empty-small">暂无历史会话</div></div><div class="aside-rule"></div><h3>当前身份</h3><div class="identity-card"><span id="chat-avatar" class="avatar large">王</span><div><b id="chat-user"></b><span id="chat-dept"></span></div></div><div class="aside-rule"></div><h3>最近引用</h3><div id="recent-citations" class="recent-citations"><div class="empty-small">本次对话的引用将显示在这里</div></div><div id="restricted-note" class="restricted-note" hidden>部分匹配资料因权限受限无法展示。</div></aside></div>
       </section>
       <section id="view-curation" class="view" hidden>
-        <div class="page-heading"><div><div class="eyebrow">问答驱动知識迭代</div><h1>知识沉淀</h1></div></div>
+        <div class="page-heading"><div><div class="eyebrow">问答驱动知识迭代</div><h1>知识沉淀</h1></div><button id="refresh-faqs" class="secondary">从历史问答挖掘 FAQ</button></div>
         <div class="tabs"><button class="tab active" data-tab="faq">FAQ 审核 <span id="faq-count" class="count-badge">0</span></button><button class="tab" data-tab="gaps">知识缺口 <span id="gap-count" class="count-badge">0</span></button></div>
         <div id="faq-list" class="curation-list"></div><div id="gap-list" class="curation-list" hidden></div>
       </section>

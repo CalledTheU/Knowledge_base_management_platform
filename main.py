@@ -60,6 +60,7 @@ BUILTIN_PERMISSIONS = {
     "management": ["dashboard.view", "chat.access"],
 }
 _chat_streams = {}
+_faq_mining_task = None
 
 
 def chat_stage(request_id, message):
@@ -107,12 +108,14 @@ def init_db():
             vector_indexed INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS chats(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, user_id TEXT NOT NULL,
             question TEXT NOT NULL, answer TEXT NOT NULL, retrieved TEXT NOT NULL, allowed TEXT NOT NULL,
-            denied TEXT NOT NULL, tokens INTEGER NOT NULL, latency_ms INTEGER NOT NULL, created REAL NOT NULL);
+            denied TEXT NOT NULL, tokens INTEGER NOT NULL, latency_ms INTEGER NOT NULL, created REAL NOT NULL,
+            faq_hit INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS gaps(id TEXT PRIMARY KEY, question TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL,
             department_id TEXT, count INTEGER NOT NULL DEFAULT 1, created REAL NOT NULL, status TEXT NOT NULL DEFAULT 'open');
         CREATE TABLE IF NOT EXISTS faqs(id TEXT PRIMARY KEY, question TEXT NOT NULL UNIQUE, answer TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'candidate', count INTEGER NOT NULL DEFAULT 1, created REAL NOT NULL,
-            cache_enabled INTEGER NOT NULL DEFAULT 0);
+            cache_enabled INTEGER NOT NULL DEFAULT 0, source_documents TEXT NOT NULL DEFAULT '[]',
+            confidence REAL NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS faq_cache(question TEXT PRIMARY KEY, faq_id TEXT NOT NULL REFERENCES faqs(id));
         CREATE TABLE IF NOT EXISTS knowledge_tasks(id TEXT PRIMARY KEY, gap_id TEXT NOT NULL UNIQUE REFERENCES gaps(id) ON DELETE CASCADE,
             title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', created REAL NOT NULL);
@@ -121,6 +124,10 @@ def init_db():
         if "cache_enabled" not in faq_columns:
             con.execute("ALTER TABLE faqs ADD COLUMN cache_enabled INTEGER NOT NULL DEFAULT 0")
             con.execute("UPDATE faqs SET cache_enabled=1 WHERE id IN (SELECT faq_id FROM faq_cache) AND status='published'")
+        if "source_documents" not in faq_columns:
+            con.execute("ALTER TABLE faqs ADD COLUMN source_documents TEXT NOT NULL DEFAULT '[]'")
+        if "confidence" not in faq_columns:
+            con.execute("ALTER TABLE faqs ADD COLUMN confidence REAL NOT NULL DEFAULT 0")
         has_permissions = "permissions" in {r["name"] for r in con.execute("PRAGMA table_info(roles)")}
         if not has_permissions:
             con.execute("ALTER TABLE roles ADD COLUMN permissions TEXT NOT NULL DEFAULT '[]'")
@@ -134,6 +141,8 @@ def init_db():
             con.execute("ALTER TABLE chunks ADD COLUMN vector_indexed INTEGER NOT NULL DEFAULT 0")
         if "source_object" not in document_columns:
             con.execute("ALTER TABLE documents ADD COLUMN source_object TEXT")
+        if "faq_hit" not in {r["name"] for r in con.execute("PRAGMA table_info(chats)")}:
+            con.execute("ALTER TABLE chats ADD COLUMN faq_hit INTEGER NOT NULL DEFAULT 0")
         for role_id, label in [("user", "普通用户"), ("knowledge_admin", "知识管理员"),
                                ("system_admin", "系统管理员"), ("management", "管理层")]:
             permissions = json.dumps(BUILTIN_PERMISSIONS[role_id])
@@ -309,6 +318,38 @@ def allowed_for(user, acl):
                (kind == "role" and subject in user["roles"]) for kind, subject in acl)
 
 
+def visible_chat_messages(session_id, user, limit=None):
+    with db() as con:
+        sql = "SELECT question,answer,allowed,created FROM chats WHERE session_id=? AND user_id=? ORDER BY created"
+        params = [session_id, user["id"]]
+        if limit:
+            sql += " DESC LIMIT ?"
+            params.append(limit)
+        rows = con.execute(sql, params).fetchall()
+        if limit:
+            rows.reverse()
+        document_ids = {doc_id for row in rows for doc_id in json.loads(row["allowed"])}
+        documents = {}
+        if document_ids:
+            placeholders = ",".join("?" for _ in document_ids)
+            for row in con.execute(
+                "SELECT d.id,d.title,d.filename,d.enabled,a.kind,a.subject FROM documents d "
+                "LEFT JOIN acl a ON a.document_id=d.id WHERE d.id IN (" + placeholders + ")", tuple(document_ids)):
+                item = documents.setdefault(row["id"], {"title": row["title"], "filename": row["filename"], "enabled": row["enabled"], "acl": []})
+                if row["kind"]:
+                    item["acl"].append((row["kind"], row["subject"]))
+    messages = []
+    for row in rows:
+        source_ids = json.loads(row["allowed"])
+        if any(doc_id not in documents or not documents[doc_id]["enabled"] or
+               not allowed_for(user, documents[doc_id]["acl"]) for doc_id in source_ids):
+            continue
+        messages.append({"question": row["question"], "answer": row["answer"], "created": row["created"],
+                         "citations": [{"document_id": doc_id, **{key: documents[doc_id][key] for key in ("title", "filename")}}
+                                       for doc_id in source_ids]})
+    return messages
+
+
 class Login(BaseModel):
     username: str
     password: str
@@ -325,10 +366,22 @@ class FAQUpdate(BaseModel):
     status: str = "candidate"
 
 
+class FAQRefresh(BaseModel):
+    threshold: int = Field(default=2, ge=2, le=100)
+
+
 @app.on_event("startup")
 def startup():
+    global _faq_mining_task
     init_db()
     repair_corrupt_documents()
+    _faq_mining_task = asyncio.create_task(faq_mining_loop())
+
+
+@app.on_event("shutdown")
+def shutdown():
+    if _faq_mining_task:
+        _faq_mining_task.cancel()
 
 
 @app.middleware("http")
@@ -457,6 +510,65 @@ def question_similarity(left, right):
     return max(word_score, char_score, SequenceMatcher(None, left, right).ratio())
 
 
+def refresh_faq_candidates(threshold=2):
+    """Idempotently mine repeated questions from stored chat logs."""
+    created = updated = 0
+    with db() as con:
+        global_documents = {row["document_id"] for row in con.execute(
+            "SELECT document_id FROM acl WHERE kind='global' AND subject='*'")}
+        rows = []
+        for row in con.execute("SELECT question,answer,allowed FROM chats ORDER BY created"):
+            source_ids = set(json.loads(row["allowed"]))
+            if source_ids and source_ids.issubset(global_documents):
+                rows.append({**dict(row), "source_ids": source_ids})
+        faqs = [dict(row) for row in con.execute("SELECT id,question,status,source_documents FROM faqs")]
+        clusters = []
+        # ponytail: greedy O(n^2) clustering; switch to incremental clustering if chat volume grows.
+        for row in rows:
+            best = max(clusters, key=lambda item: question_similarity(row["question"], item["question"]), default=None)
+            similarity = question_similarity(row["question"], best["question"]) if best else 0
+            if best and similarity >= 0.55:
+                best["count"] += 1
+                best["similarity_total"] += similarity
+                best["source_ids"].update(row["source_ids"])
+                if not best["answer"] and row["answer"]:
+                    best["answer"] = row["answer"]
+            else:
+                clusters.append({"question": row["question"], "answer": row["answer"], "count": 1,
+                                 "similarity_total": 1.0, "source_ids": set(row["source_ids"])})
+        for cluster in clusters:
+            if cluster["count"] < threshold:
+                continue
+            confidence = round(cluster["similarity_total"] / cluster["count"], 3)
+            source_documents = json.dumps(sorted(cluster["source_ids"]))
+            match = max(faqs, key=lambda faq: question_similarity(cluster["question"], faq["question"]), default=None)
+            if match and question_similarity(cluster["question"], match["question"]) >= 0.55:
+                if match["status"] != "rejected":
+                    sources = sorted(set(json.loads(match["source_documents"] or "[]")) | cluster["source_ids"])
+                    con.execute("UPDATE faqs SET count=?,source_documents=?,confidence=? WHERE id=?",
+                                (cluster["count"], json.dumps(sources), confidence, match["id"]))
+                    updated += 1
+                continue
+            faq_id = str(uuid.uuid4())
+            con.execute("INSERT INTO faqs(id,question,answer,status,count,created,cache_enabled,source_documents,confidence) VALUES(?,?,?,?,?,?,0,?,?)",
+                        (faq_id, cluster["question"], cluster["answer"], "candidate", cluster["count"], time.time(), source_documents, confidence))
+            faqs.append({"id": faq_id, "question": cluster["question"], "status": "candidate",
+                         "source_documents": source_documents})
+            created += 1
+    return created, updated
+
+
+async def faq_mining_loop():
+    while True:
+        await asyncio.sleep(300)
+        try:
+            created, updated = await asyncio.to_thread(refresh_faq_candidates)
+            logger.info("FAQ_REFRESH created=%s updated=%s", created, updated,
+                        extra={"request_id": "faq-mining"})
+        except Exception:
+            logger.exception("FAQ_REFRESH failed", extra={"request_id": "faq-mining"})
+
+
 def build_grounded_answer(question, ranked):
     """Compress retrieved chunks into relevant evidence instead of dumping whole chunks."""
     qwords = words(question)
@@ -492,6 +604,10 @@ def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: 
     if not question:
         raise HTTPException(400, "Question cannot be empty")
     external = rag_service.external_enabled()
+    session_id = body.session_id or str(uuid.uuid4())
+    previous = visible_chat_messages(session_id, user, 6)
+    context = "\n".join(f"用户：{row['question']}\n助手：{row['answer'][:500]}" for row in previous)
+    retrieval_question = f"{context}\n用户：{question}" if context else question
     try:
         chat_stage(request_id, "正在准备知识库检索")
         with db() as con:
@@ -508,7 +624,7 @@ def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: 
             chat_stage(request_id, "正在同步待索引知识切片")
             sync_pending_chunks()
             chat_stage(request_id, "正在进行问题向量化")
-            direct_ids = rag_service.hybrid_search(encode_query(question))
+            direct_ids = rag_service.hybrid_search(encode_query(retrieval_question))
             chat_stage(request_id, "正在进行 Milvus 混合检索")
             try:
                 chat_stage(request_id, "正在生成 HyDE 假设文档")
@@ -517,7 +633,7 @@ def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: 
                 hyde = ""
                 logger.exception("HyDE generation failed question_length=%s", len(question),
                                  extra={"request_id": str(uuid.uuid4())})
-            hyde_ids = rag_service.hybrid_search(encode_query(question + "\n" + hyde)) if hyde else []
+            hyde_ids = rag_service.hybrid_search(encode_query(retrieval_question + "\n" + hyde)) if hyde else []
             chat_stage(request_id, "正在进行 RRF 检索结果融合")
             candidate_ids = rag_service.reciprocal_rank_fusion(direct_ids, hyde_ids)
             if candidate_ids:
@@ -560,7 +676,7 @@ def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: 
             cached = None
         try:
             chat_stage(request_id, "正在使用 BGE Reranker 重排结果")
-            reranked = rag_service.rerank(question, [{
+            reranked = rag_service.rerank(retrieval_question, [{
                 "chunk_id": chunk["id"], "document_id": doc_id,
                 "title": doc["title"], "filename": doc["filename"], "content": chunk["content"],
             } for _, doc_id, doc, chunk in ranked])
@@ -574,7 +690,7 @@ def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: 
     else:
         qwords = words(question)
         try:
-            query_vector = encode_query(question)
+            query_vector = encode_query(retrieval_question)
         except Exception:
             request_id = str(uuid.uuid4())
             logger.exception("Chat embedding failed question_length=%s", len(question), extra={"request_id": request_id})
@@ -605,7 +721,7 @@ def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: 
         if external:
             try:
                 chat_stage(request_id, "正在根据授权切片生成答案")
-                answer = rag_service.generate_answer(question, reranked)
+                answer = rag_service.generate_answer(question, reranked, history=context)
             except Exception:
                 request_id = str(uuid.uuid4())
                 logger.exception("Chat answer generation failed question_length=%s", len(question),
@@ -621,25 +737,16 @@ def ask(body: Ask, user=Depends(require_permission("chat.access")), request_id: 
     chat_stage(request_id, "问答处理完成")
     chat_id = str(uuid.uuid4())
     with db() as con:
-        con.execute("INSERT INTO chats VALUES(?,?,?,?,?,?,?,?,?,?,?)", (chat_id, body.session_id or str(uuid.uuid4()),
+        con.execute("INSERT INTO chats(id,session_id,user_id,question,answer,retrieved,allowed,denied,tokens,latency_ms,created,faq_hit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (chat_id, session_id,
             user["id"], question, answer, json.dumps([x[1] for x in ranked + denied]),
             json.dumps([x[1] for x in ranked]), json.dumps([x[1] for x in denied]),
-            max(1, (len(question) + len(answer)) // 4), elapsed, time.time()))
+            max(1, (len(question) + len(answer)) // 4), elapsed, time.time(), int(bool(cached))))
         if not citations:
             con.execute("INSERT INTO gaps(id,question,user_id,department_id,created) VALUES(?,?,?,?,?) ON CONFLICT(question) DO UPDATE SET count=count+1",
                         (str(uuid.uuid4()), question, user["id"], user["department_id"], time.time()))
-        if not cached:
-            candidates = con.execute("SELECT id,question FROM faqs").fetchall()
-            exact = next((row for row in candidates if row["question"] == question), None)
-            match = exact or max((row for row in candidates if row["question"] != question),
-                                 key=lambda row: question_similarity(question, row["question"]), default=None)
-            if match and question_similarity(question, match["question"]) >= 0.55:
-                con.execute("UPDATE faqs SET count=count+1 WHERE id=?", (match["id"],))
-            else:
-                con.execute("INSERT INTO faqs(id,question,answer,status,count,created,cache_enabled) VALUES(?,?,?,?,1,?,0)",
-                            (str(uuid.uuid4()), question, answer, "candidate", time.time()))
     return {"id": chat_id, "question": question, "answer": answer, "citations": citations,
-            "restricted": bool(denied), "faq_hit": bool(cached), "latency_ms": elapsed}
+            "restricted": bool(denied), "faq_hit": bool(cached), "latency_ms": elapsed,
+            "session_id": session_id, "history": [{"question": row["question"], "answer": row["answer"]} for row in previous]}
 
 
 @app.post("/api/chat/stream")
@@ -680,22 +787,70 @@ async def ask_stream(body: Ask, user=Depends(require_permission("chat.access")))
 @app.get("/api/dashboard")
 def dashboard(user=Depends(require_permission("dashboard.view"))):
     with db() as con:
+        daily = [dict(r) for r in con.execute(
+            "SELECT date(created,'unixepoch','localtime') day,count(*) questions,coalesce(sum(tokens),0) tokens "
+            "FROM chats WHERE created>=? GROUP BY day ORDER BY day", (time.time() - 14 * 86400,))]
+        latency = [dict(r) for r in con.execute(
+            "SELECT CASE WHEN latency_ms<500 THEN '<500ms' WHEN latency_ms<1500 THEN '500-1500ms' "
+            "WHEN latency_ms<3000 THEN '1500-3000ms' ELSE '>=3000ms' END bucket,count(*) count "
+            "FROM chats GROUP BY bucket ORDER BY min(latency_ms)")]
         return {
             "questions": con.execute("SELECT count(*) FROM chats").fetchone()[0],
+            "pv": con.execute("SELECT count(*) FROM chats").fetchone()[0],
             "uv": con.execute("SELECT count(DISTINCT user_id) FROM chats").fetchone()[0],
             "knowledge": con.execute("SELECT count(*) FROM documents").fetchone()[0],
             "tokens": con.execute("SELECT coalesce(sum(tokens),0) FROM chats").fetchone()[0],
             "avg_latency": con.execute("SELECT coalesce(avg(latency_ms),0) FROM chats").fetchone()[0],
-            "faq_hits": con.execute("SELECT count(*) FROM chats WHERE question IN (SELECT question FROM faq_cache)").fetchone()[0],
+            "faq_hits": con.execute("SELECT coalesce(sum(faq_hit),0) FROM chats").fetchone()[0],
             "top_questions": [dict(r) for r in con.execute("SELECT question,count(*) count FROM chats GROUP BY question ORDER BY count DESC LIMIT 8")],
             "top_knowledge": [dict(r) for r in con.execute("SELECT d.title,count(*) count FROM chats c,json_each(c.allowed) j JOIN documents d ON d.id=j.value GROUP BY d.id ORDER BY count DESC LIMIT 8")],
+            "daily": daily,
+            "latency_distribution": latency,
+            "faq_hit_rate": round((con.execute("SELECT coalesce(sum(faq_hit),0) FROM chats").fetchone()[0] / max(1, con.execute("SELECT count(*) FROM chats").fetchone()[0])) * 100, 1),
         }
+
+
+@app.get("/api/chat/sessions")
+def chat_sessions(user=Depends(require_permission("chat.access"))):
+    with db() as con:
+        sessions = [dict(row) for row in con.execute(
+            "SELECT session_id,min(created) created,max(created) updated FROM chats "
+            "WHERE user_id=? GROUP BY session_id ORDER BY updated DESC LIMIT 30", (user["id"],))]
+    visible = []
+    for session in sessions:
+        messages = visible_chat_messages(session["session_id"], user)
+        if messages:
+            visible.append({**session, "messages": len(messages), "title": messages[0]["question"]})
+    return visible
+
+
+@app.get("/api/chat/sessions/{session_id}")
+def chat_session(session_id: str, user=Depends(require_permission("chat.access"))):
+    return {"session_id": session_id, "messages": visible_chat_messages(session_id, user)}
 
 
 @app.get("/api/faqs")
 def faqs(user=Depends(require_permission("curation.manage"))):
     with db() as con:
-        return [dict(r) for r in con.execute("SELECT * FROM faqs ORDER BY count DESC,created DESC")]
+        result = [dict(r) for r in con.execute("SELECT * FROM faqs ORDER BY count DESC,created DESC")]
+        document_ids = {doc_id for faq in result for doc_id in json.loads(faq["source_documents"] or "[]")}
+        documents = {}
+        if document_ids:
+            placeholders = ",".join("?" for _ in document_ids)
+            documents = {row["id"]: dict(row) for row in con.execute(
+                "SELECT id,title,filename FROM documents WHERE id IN (" + placeholders + ")", tuple(document_ids))}
+        for faq in result:
+            faq["related_documents"] = [documents[doc_id] for doc_id in json.loads(faq["source_documents"] or "[]")
+                                        if doc_id in documents]
+        return result
+
+
+@app.post("/api/faqs/refresh")
+def refresh_faqs(body: FAQRefresh = FAQRefresh(), user=Depends(require_permission("curation.manage"))):
+    created, updated = refresh_faq_candidates(body.threshold)
+    logger.info("FAQ_REFRESH created=%s updated=%s threshold=%s", created, updated, body.threshold,
+                extra={"request_id": str(uuid.uuid4())})
+    return {"created": created, "updated": updated, "threshold": body.threshold}
 
 
 @app.put("/api/faqs/{faq_id}")

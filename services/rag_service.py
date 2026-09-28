@@ -170,8 +170,11 @@ def rerank(question, documents):
         key=lambda document: document["score"], reverse=True)
 
 
-def generate_answer(question, documents):
+def generate_answer(question, documents, history=""):
     from langchain_core.messages import HumanMessage, SystemMessage
+
+    if history:
+        question = "Previous conversation:\n" + history + "\n\nCurrent question:\n" + question
 
     context = []
     used = 0
